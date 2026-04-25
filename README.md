@@ -71,8 +71,8 @@
 ### Локально (venv)
 
 ```bash
-git clone https://github.com/hsemlcourse/hseml-group-project-TheOddDream.git
-cd hseml-group-project-TheOddDream
+git clone https://github.com/hsemlcourse/hseml-group-project-theodddream-1.git
+cd hseml-group-project-theodddream-1
 
 # 1. Виртуальное окружение
 python -m venv .venv
