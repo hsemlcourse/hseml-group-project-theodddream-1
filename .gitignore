@@ -101,3 +101,9 @@ ehthumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Project-local
+_build/
+instructions (.gitignore this).txt
+.claude/
+
