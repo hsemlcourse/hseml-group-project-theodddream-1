@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -69,12 +70,34 @@ def _safe_age_years(dob: pd.Series, ref: pd.Series) -> pd.Series:
     return age.fillna(age.median())
 
 
-def engineer_features(df: pd.DataFrame, location_freq: dict[str, int] | None = None) -> tuple[pd.DataFrame, dict]:
+def _compute_customer_aggregates(df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Compute per-customer transaction statistics (fit on train only)."""
+    grouped = df.groupby("CustomerID")[TARGET]
+    return {
+        "customer_median": grouped.median().to_dict(),
+        "customer_mean": grouped.mean().to_dict(),
+        "customer_std": grouped.std().fillna(0).to_dict(),
+        "customer_count": grouped.count().to_dict(),
+    }
+
+
+def _compute_target_encoding(
+    df: pd.DataFrame, col: str, global_mean: float, min_samples: int = 100,
+) -> dict[str, float]:
+    """Smoothed target encoding: blend category mean with global mean based on sample count."""
+    stats = df.groupby(col)[TARGET].agg(["mean", "count"])
+    smoothing = stats["count"] / (stats["count"] + min_samples)
+    encoded = smoothing * stats["mean"] + (1 - smoothing) * global_mean
+    return encoded.to_dict()
+
+
+def engineer_features(df: pd.DataFrame, artifacts: dict[str, Any] | None = None) -> tuple[pd.DataFrame, dict]:
     """Build derived features. Returns (features_df, fitted_artifacts_dict).
 
-    `location_freq` should be passed for val/test (computed on train) to avoid leakage.
+    `artifacts` should be passed for val/test (computed on train) to avoid leakage.
     """
     out = df.copy()
+    fitted: dict[str, Any] = {}
 
     out["Age"] = _safe_age_years(out["CustomerDOB"], out["TransactionDate"])
     out["AgeBucket"] = pd.cut(
@@ -88,12 +111,52 @@ def engineer_features(df: pd.DataFrame, location_freq: dict[str, int] | None = N
     out["TransactionHour"] = time_str.str[:2].astype(int).clip(0, 23)
     out["TransactionDayOfWeek"] = out["TransactionDate"].dt.dayofweek
     out["TransactionMonth"] = out["TransactionDate"].dt.month
+    out["IsBusinessHour"] = out["TransactionHour"].between(9, 18).astype(int)
 
     out["LogBalance"] = np.log1p(out["CustAccountBalance"].clip(lower=0))
 
-    if location_freq is None:
+    # Location frequency encoding
+    if artifacts is None:
         location_freq = out["CustLocation"].value_counts().to_dict()
+    else:
+        location_freq = artifacts["location_freq"]
     out["LocationFreq"] = out["CustLocation"].map(location_freq).fillna(0).astype(int)
+    fitted["location_freq"] = location_freq
+
+    # Target encoding for CustLocation (smoothed)
+    if artifacts is None:
+        global_mean = out[TARGET].mean()
+        location_target_enc = _compute_target_encoding(out, "CustLocation", global_mean)
+        fitted["location_target_enc"] = location_target_enc
+        fitted["global_mean"] = global_mean
+    else:
+        location_target_enc = artifacts["location_target_enc"]
+        global_mean = artifacts["global_mean"]
+    out["LocationTargetEnc"] = out["CustLocation"].map(location_target_enc).fillna(global_mean)
+
+    # Customer aggregates (historical behavior)
+    if artifacts is None:
+        cust_aggs = _compute_customer_aggregates(out)
+        fitted["customer_aggregates"] = cust_aggs
+    else:
+        cust_aggs = artifacts["customer_aggregates"]
+    out["CustMedianAmount"] = out["CustomerID"].map(cust_aggs["customer_median"]).fillna(global_mean)
+    out["CustMeanAmount"] = out["CustomerID"].map(cust_aggs["customer_mean"]).fillna(global_mean)
+    out["CustStdAmount"] = out["CustomerID"].map(cust_aggs["customer_std"]).fillna(0)
+    out["CustTxnCount"] = out["CustomerID"].map(cust_aggs["customer_count"]).fillna(1)
+    out["LogCustTxnCount"] = np.log1p(out["CustTxnCount"])
+
+    # Interaction features
+    out["LogBalance_x_Age"] = out["LogBalance"] * out["Age"]
+    out["Balance_per_TxnCount"] = out["LogBalance"] / out["LogCustTxnCount"].clip(lower=0.1)
+
+    # Outlier flag
+    if artifacts is None:
+        balance_p99 = out["CustAccountBalance"].quantile(0.99)
+        fitted["balance_p99"] = balance_p99
+    else:
+        balance_p99 = artifacts["balance_p99"]
+    out["HighBalance"] = (out["CustAccountBalance"] > balance_p99).astype(int)
 
     out = pd.get_dummies(out, columns=["CustGender", "AgeBucket"], drop_first=False)
 
@@ -102,12 +165,16 @@ def engineer_features(df: pd.DataFrame, location_freq: dict[str, int] | None = N
         "CustomerID",
         "CustomerDOB",
         "CustLocation",
+        "CustAccountBalance",
         "TransactionDate",
         "TransactionTime",
     ]
     out = out.drop(columns=[c for c in drop_cols if c in out.columns])
 
-    return out, {"location_freq": location_freq}
+    # Sanitize column names for XGBoost compatibility (no [, ], <, > allowed)
+    out.columns = [c.replace("[", "").replace("]", "").replace("<", "lt").replace(">", "gt") for c in out.columns]
+
+    return out, fitted
 
 
 def _stratify_bins(y: pd.Series, n_bins: int = 10) -> pd.Series:
@@ -150,8 +217,8 @@ def fit_transform_pipeline(
 ) -> tuple[tuple[pd.DataFrame, pd.Series], tuple[pd.DataFrame, pd.Series], tuple[pd.DataFrame, pd.Series], dict]:
     """Apply feature engineering with no leakage: fit artifacts on train, apply to val/test."""
     train_feat, artifacts = engineer_features(train)
-    val_feat, _ = engineer_features(val, location_freq=artifacts["location_freq"])
-    test_feat, _ = engineer_features(test, location_freq=artifacts["location_freq"])
+    val_feat, _ = engineer_features(val, artifacts=artifacts)
+    test_feat, _ = engineer_features(test, artifacts=artifacts)
 
     val_feat = val_feat.reindex(columns=train_feat.columns, fill_value=0)
     test_feat = test_feat.reindex(columns=train_feat.columns, fill_value=0)

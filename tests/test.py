@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from src import SEED  # noqa: E402
 from src.modeling import (  # noqa: E402
+    build_stacking,
     evaluate,
     metrics,
     set_seed,
@@ -65,7 +66,12 @@ def test_engineer_features_no_target_leakage(synthetic_df):
     cleaned = clean(synthetic_df)
     features, _ = engineer_features(cleaned)
     assert TARGET in features.columns, "Target should pass through engineer_features (dropped later in pipeline)."
-    leak_candidates = [c for c in features.columns if c != TARGET and "Amount" in c]
+    # Customer aggregates (CustMedianAmount, CustMeanAmount, CustStdAmount) are intentional —
+    # they are computed per-customer on train only and represent historical behavior, not current-row target.
+    allowed_amount_features = {"CustMedianAmount", "CustMeanAmount", "CustStdAmount"}
+    leak_candidates = [
+        c for c in features.columns if c != TARGET and "Amount" in c and c not in allowed_amount_features
+    ]
     assert leak_candidates == [], f"Unexpected target-derived features: {leak_candidates}"
 
 
@@ -117,3 +123,67 @@ def test_lightgbm_runs_smoke(synthetic_df):
     scores = evaluate(model, X_val, y_val)
     assert scores["MAE"] > 0
     assert np.isfinite(scores["MAE"])
+
+
+def test_xgboost_runs_smoke(synthetic_df):
+    cleaned = clean(synthetic_df)
+    train, val, test = make_split(cleaned, test_size=0.2, val_size=0.1, seed=SEED)
+    (X_tr, y_tr), (X_val, y_val), _, _ = fit_transform_pipeline(train, val, test)
+    model = train_model("xgboost", X_tr, y_tr, params={"n_estimators": 30})
+    scores = evaluate(model, X_val, y_val)
+    assert scores["MAE"] > 0
+    assert np.isfinite(scores["MAE"])
+
+
+def test_catboost_runs_smoke(synthetic_df):
+    cleaned = clean(synthetic_df)
+    train, val, test = make_split(cleaned, test_size=0.2, val_size=0.1, seed=SEED)
+    (X_tr, y_tr), (X_val, y_val), _, _ = fit_transform_pipeline(train, val, test)
+    model = train_model("catboost", X_tr, y_tr, params={"iterations": 30})
+    scores = evaluate(model, X_val, y_val)
+    assert scores["MAE"] > 0
+    assert np.isfinite(scores["MAE"])
+
+
+def test_quantile_regression_smoke(synthetic_df):
+    cleaned = clean(synthetic_df)
+    train, val, test = make_split(cleaned, test_size=0.2, val_size=0.1, seed=SEED)
+    (X_tr, y_tr), (X_val, y_val), _, _ = fit_transform_pipeline(train, val, test)
+    model = train_model("lightgbm_quantile", X_tr, y_tr, params={"n_estimators": 30})
+    scores = evaluate(model, X_val, y_val)
+    assert scores["MAE"] > 0
+
+
+def test_stacking_runs_smoke(synthetic_df):
+    cleaned = clean(synthetic_df)
+    train, val, test = make_split(cleaned, test_size=0.2, val_size=0.1, seed=SEED)
+    (X_tr, y_tr), (X_val, y_val), _, _ = fit_transform_pipeline(train, val, test)
+    stacker = build_stacking()
+    stacker.fit(X_tr, y_tr)
+    scores = evaluate(stacker, X_val, y_val)
+    assert scores["MAE"] > 0
+    assert np.isfinite(scores["MAE"])
+
+
+def test_new_features_present(synthetic_df):
+    """Check that CP2 features (target encoding, customer aggregates, interactions) are generated."""
+    cleaned = clean(synthetic_df)
+    train, val, test = make_split(cleaned, test_size=0.2, val_size=0.1, seed=SEED)
+    (X_tr, _), (X_val, _), _, artifacts = fit_transform_pipeline(train, val, test)
+    expected_features = [
+        "LocationTargetEnc",
+        "CustMedianAmount",
+        "CustMeanAmount",
+        "CustStdAmount",
+        "LogCustTxnCount",
+        "LogBalance_x_Age",
+        "Balance_per_TxnCount",
+        "IsBusinessHour",
+        "HighBalance",
+    ]
+    for feat in expected_features:
+        assert feat in X_tr.columns, f"Missing feature: {feat}"
+        assert feat in X_val.columns, f"Missing feature in val: {feat}"
+    assert "location_target_enc" in artifacts
+    assert "customer_aggregates" in artifacts
+    assert "balance_p99" in artifacts

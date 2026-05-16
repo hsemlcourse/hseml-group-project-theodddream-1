@@ -43,25 +43,28 @@
 ├── data
 │   ├── processed               # Очищенные и обработанные данные (gitignored)
 │   └── raw                     # Исходный CSV из Kaggle (gitignored)
-├── models                      # baseline.joblib, best_model.joblib (gitignored)
+├── models                      # baseline.joblib, best_model_cp2.joblib (gitignored)
 ├── notebooks
 │   ├── 01_eda.ipynb            # EDA на полном датасете, обоснование MAE
 │   ├── 02_baseline.ipynb       # Baseline LinearRegression "из коробки"
-│   └── 03_experiments.ipynb    # 5 моделей + тюнинг + ансамбль + PCA + log-target
-├── presentation                # Презентация для защиты (на следующих чекпоинтах)
+│   ├── 03_experiments.ipynb    # CP1: 5 моделей + тюнинг + ансамбль + PCA + log-target
+│   └── 04_cp2_experiments.ipynb # CP2: XGBoost, CatBoost, Stacking, Quantile, новый FE
+├── presentation                # Презентация для защиты
 ├── report
-│   ├── images                  # Графики из EDA, попадают в report.md
-│   └── report.md               # Финальный отчёт
+│   ├── images                  # Графики из EDA и экспериментов
+│   └── report.md               # Финальный отчёт (CP1 + CP2)
 ├── src
 │   ├── __init__.py             # SEED = 42
 │   ├── preprocessing.py        # load_raw, clean, engineer_features, make_split, ...
-│   └── modeling.py             # train_baseline, train_model, tune_*, build_ensemble, metrics
+│   ├── modeling.py             # train_*, tune_*, build_stacking, build_ensemble, metrics
+│   └── parser.py               # Парсинг данных: Kaggle API, ZIP, geo-enrichment
 ├── tests
-│   └── test.py                 # Smoke-тесты пайплайна (pytest)
+│   └── test.py                 # 12 smoke-тестов пайплайна (pytest)
 ├── .github/workflows/ci.yml    # CI: ruff check src/
 ├── Dockerfile                  # python:3.10-slim + libgomp1 + requirements
+├── docker-compose.yml          # Сервисы: app (тесты), lint (ruff), jupyter
 ├── pyproject.toml              # ruff и pytest конфиги
-├── requirements.txt
+├── requirements.txt            # Пиннинг версий (numpy, pandas, sklearn, lgbm, xgb, catboost)
 └── README.md
 ```
 
@@ -92,39 +95,68 @@ papermill notebooks/02_baseline.ipynb   notebooks/02_baseline.ipynb   --cwd note
 papermill notebooks/03_experiments.ipynb notebooks/03_experiments.ipynb --cwd notebooks
 ```
 
-### Через Docker
+### Через Docker / Docker Compose
 
 ```bash
-docker build -t hseml-cp1 .
-docker run --rm hseml-cp1                                  # дефолтный CMD: pytest -q tests/
-docker run --rm hseml-cp1 ruff check src/ --line-length 120
-# Запуск ноутбуков с подмонтированными данными:
+# Docker Compose (рекомендуется)
+docker-compose up app          # запустить тесты
+docker-compose up lint         # запустить линтер
+docker-compose up jupyter      # Jupyter на порту 8888
+
+# Или напрямую через Docker
+docker build -t hseml-project .
+docker run --rm hseml-project                                  # дефолтный CMD: pytest -q tests/
+docker run --rm hseml-project ruff check src/ --line-length 120
 docker run --rm -v "$PWD/data:/app/data" -v "$PWD/models:/app/models" \
-    hseml-cp1 papermill notebooks/03_experiments.ipynb /tmp/out.ipynb --cwd notebooks
+    hseml-project papermill notebooks/04_cp2_experiments.ipynb /tmp/out.ipynb --cwd notebooks
+```
+
+### Парсинг данных
+
+```bash
+# Скачать с Kaggle API (нужен ~/.kaggle/kaggle.json)
+python -m src.parser --download --validate
+
+# Или извлечь из локального ZIP
+python -m src.parser --extract --validate
+
+# Получить гео-данные для обогащения
+python -m src.parser --geo
 ```
 
 
 ## Данные
 - `data/raw/bank_transactions.csv` — исходный файл с Kaggle (~67 MB, 1 048 567 строк, 9 колонок). Не коммитим: на нём действует `.gitignore`.
-- `data/processed/` — на CP1 не используется (вся предобработка делается на лету в `src/preprocessing.py`).
+- `data/raw/india_cities_geo.csv` — гео-данные городов Индии (парсятся скриптом `src/parser.py`).
+- `data/processed/` — вся предобработка делается на лету в `src/preprocessing.py`.
 
 
 ## Результаты
 
-Сводная таблица по основным экспериментам (val/test получены на стратифицированных по `log1p(target)` отложенных выборках; финальная модель переобучена на полном train).
+Сводная таблица (val/test на стратифицированных по `log1p(target)` отложенных выборках; финальная модель переобучена на полном train).
 
-| Модель | MAE (INR) ↓ | RMSE (INR) ↓ | R² ↑ | Примечание |
-|--------|-------------|--------------|------|------------|
-| Baseline LinearRegression (val) | 1823.26 | 6274.13 | 0.00 | 2 сырые фичи, без feature engineering |
-| Baseline LinearRegression (test) | 1820.12 | 6765.23 | 0.01 | |
-| **LightGBM tuned, log1p(target)** (val) | **1346.99** | 6294.90 | ≈0.00 | Победитель по MAE; полный feature set |
-| **LightGBM tuned, log1p(target)** (test) | **1343.92** | 6799.36 | ≈0.00 | Финальная модель, переобучена на полном train |
+### CP1
 
-**Улучшение MAE относительно baseline:** −26% (с 1820 до 1344 INR).
+| Модель | MAE (INR) | RMSE (INR) | R² | Примечание |
+|--------|-----------|------------|-----|------------|
+| Baseline LinearRegression (test) | 1820.12 | 6765.23 | 0.01 | 2 сырые фичи |
+| LightGBM tuned, log1p(target) (test) | **1343.92** | 6799.36 | ~0.00 | CP1 победитель |
 
-**Замечание про R²/RMSE.** У победителя R² ≈ 0 и RMSE сопоставим с baseline — это ожидаемый эффект обучения на `log1p(target)`: модель оптимизирует относительную ошибку на типичных операциях (где плотность распределения максимальна) ценой худшей точности на гигантских транзакциях из правого хвоста. Это полностью согласовано с выбранной основной метрикой (MAE) и характером данных (skew ≈ 47).
+### CP2 (расширенный feature set + новые модели)
 
-Полный список экспериментов с гиперпараметрами и временем обучения — в `notebooks/03_experiments.ipynb` (раздел «Сводная таблица экспериментов»).
+| Модель | MAE (INR) | Примечание |
+|--------|-----------|------------|
+| XGBoost (tuned) | TBD | После тюнинга |
+| CatBoost (tuned, log1p) | TBD | CatBoost + log-trick |
+| LightGBM Quantile (alpha=0.5) | TBD | Прямая минимизация MAE |
+| Stacking (RF+LGBM+XGB -> Ridge) | TBD | Мета-обучение |
+| **LightGBM tuned, log1p, new FE** | TBD | CP2 победитель (ожидаемо) |
+
+*TBD — заполняется после прогона `notebooks/04_cp2_experiments.ipynb` на данных.*
+
+**Замечание про R²/RMSE.** У победителя R² ~ 0 — это ожидаемый эффект `log1p(target)`: модель оптимизирует относительную ошибку на типичных операциях ценой точности на гигантских транзакциях. Согласовано с основной метрикой MAE и характером данных (skew ~ 47).
+
+Полные таблицы экспериментов: `notebooks/03_experiments.ipynb` (CP1) и `notebooks/04_cp2_experiments.ipynb` (CP2).
 
 
 ## Отчёт

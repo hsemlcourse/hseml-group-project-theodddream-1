@@ -202,19 +202,95 @@
 
 ---
 
-## 7. Заключение и выводы
+## 7. Заключение CP1
 
 - **Что сделано на CP1.** Очистка и feature engineering с защитой от лика, стратифицированный по `log1p(target)` сплит, обоснованная метрика (MAE), baseline + 5 моделей + ансамбль + два дополнительных эксперимента (log-target, PCA), тюнинг RF и LightGBM, фиксированный seed во всех модулях, тесты (7 шт., все зелёные), ruff-конфиг (совпадает с CI), Docker, заполненный README и отчёт.
-- **Достигнутый результат.** **Test MAE 1343.92 INR** против baseline **1820.12 INR** — улучшение на **−26%**. Победитель — LightGBM с тюненными гиперами, обученный на `log1p(target)`.
-- **Главный технический челлендж и его решение.** Тяжёлый правый хвост таргета (skew ≈ 47, диапазон 6 порядков). На исходной шкале даже бустинг с тюнингом улучшал MAE лишь на ≈3% относительно baseline. **Ключевой шаг — обучение на `log1p(target)`**: эта одна гипотеза дала бóльшую часть прироста (1758 → 1356 на val) — она штрафует относительную, а не абсолютную ошибку и тянет предсказание к медиане условного распределения, что естественно для финансовых сумм такого скоса.
-- **Что НЕ сработало.**
-  - PCA на 16 фичах резко ухудшил MAE (1786 → 2947) — разрушает разреженную one-hot структуру.
-  - Регуляризация Ridge на этом масштабе не отличается от обычной OLS.
-  - VotingRegressor проиграл одиночному LGBM на log-таргете — потому что Ridge и RF тянут предсказание обратно в среднее.
-- **Ограничения.** R² ≈ 0 у финальной модели говорит о том, что демография + баланс лишь умеренно объясняют конкретную сумму операции. «Потолок» MAE на таких фичах, похоже, около 1300–1400 INR. Для серьёзного скачка нужны исторические признаки клиента.
-- **Возможные улучшения (на следующие чекпоинты).**
-  1. **Исторические агрегаты по `CustomerID`** — median/mean/std/quantile предыдущих транзакций; критично следить за time-leakage (брать только операции до текущей даты).
-  2. **Target encoding для `CustLocation`** с out-of-fold-регуляризацией — даст более информативное представление города, чем просто частота.
-  3. **Квантильная регрессия** `LGBMRegressor(objective="quantile", alpha=0.5)` — напрямую минимизирует MAE, без обходного `log1p`.
-  4. **Monotone-constraints** для `LogBalance` (баланс ↑ → амаунт ↑ в среднем) — стабильность модели на новых данных.
-  5. **Деплой** (CP2): обернуть `models/best_model.joblib` в FastAPI + Streamlit, написать инструкцию запуска и снять видео-демо.
+- **Достигнутый результат CP1.** **Test MAE 1343.92 INR** против baseline **1820.12 INR** — улучшение на **−26%**.
+
+---
+
+## 8. CP2 — Расширение моделирования и feature engineering
+
+### 8.1. Новый feature engineering
+
+В CP2 feature space расширен с ~16 до ~25+ признаков:
+
+| Фича | Формула | Зачем |
+|---|---|---|
+| `CustMedianAmount` | медиана `TransactionAmount` по `CustomerID` (на train) | Исторический уровень трат клиента |
+| `CustMeanAmount` | среднее по `CustomerID` | Альтернативная оценка |
+| `CustStdAmount` | std по `CustomerID` | Волатильность поведения |
+| `LogCustTxnCount` | `log1p(count по CustomerID)` | Активность клиента |
+| `LocationTargetEnc` | smoothed target encoding `CustLocation` | Более информативно, чем frequency |
+| `LogBalance_x_Age` | `LogBalance * Age` | Interaction: состоятельность x возраст |
+| `Balance_per_TxnCount` | `LogBalance / LogCustTxnCount` | Баланс на единицу активности |
+| `IsBusinessHour` | 1 если час в [9, 18] | Бизнес-операции vs. вечерние |
+| `HighBalance` | 1 если баланс > 99-перцентиля | Outlier-сигнал |
+
+**Защита от лика:**
+- Customer aggregates считаются **только по train**, затем маппятся на val/test по `CustomerID`.
+- Target encoding использует **сглаживание** (smoothing с `min_samples=100`): для редких локаций значение тяготеет к глобальному среднему.
+- `balance_p99` — порог вычислен на train, применяется без пересчёта.
+
+### 8.2. Новые модели
+
+| Модель | Описание |
+|---|---|
+| **XGBoost** | Gradient boosting альтернатива LightGBM; тюнинг через `RandomizedSearchCV` |
+| **XGBoost log1p(target)** | XGBoost с обучением на log-шкале |
+| **CatBoost** | Бустинг с нативной поддержкой категорий; тюнинг |
+| **CatBoost log1p(target)** | CatBoost с log-trick |
+| **LightGBM Quantile (alpha=0.5)** | Прямая минимизация MAE через квантильный loss |
+| **StackingRegressor** | Meta-learner Ridge над (RF + LGBM + XGB) |
+| **Stacking log1p(target)** | Стекинг на log-шкале |
+
+### 8.3. Подбор гиперпараметров
+
+- **XGBoost:** `RandomizedSearchCV`, n_iter=15, 3-fold. Пространство: `n_estimators`, `learning_rate`, `max_depth`, `subsample`, `colsample_bytree`, `reg_alpha`, `reg_lambda`, `min_child_weight`.
+- **CatBoost:** `RandomizedSearchCV`, n_iter=10, 3-fold. Пространство: `iterations`, `learning_rate`, `depth`, `l2_leaf_reg`, `bagging_temperature`.
+- **LightGBM (re-tune на новых фичах):** `RandomizedSearchCV`, n_iter=20, 3-fold.
+
+### 8.4. Таблица экспериментов CP2 (val)
+
+Полная сводная таблица с параметрами и временем обучения — в `notebooks/04_cp2_experiments.ipynb`.
+
+### 8.5. Обоснование финальной модели CP2
+
+**Победитель:** LightGBM tuned + log1p(target) + расширенный feature set.
+
+Обоснование:
+1. **Минимум MAE на val** среди всех экспериментов CP1 + CP2.
+2. **Customer aggregates** — самый значимый прирост качества: медианная сумма клиента — сильнейший предиктор.
+3. **Target encoding** для `CustLocation` информативнее frequency encoding.
+4. **log1p-трансформация** по-прежнему критична для скошенного таргета.
+5. **XGBoost и CatBoost** сопоставимы с LightGBM, но LightGBM быстрее и чуть точнее.
+6. **Стекинг** стабилен, но не побеждает одиночный бустинг с log-target.
+
+### 8.6. Самостоятельный парсинг данных
+
+Реализован скрипт `src/parser.py`:
+- **Загрузка с Kaggle API** (`download_from_kaggle()`) — автоматический download.
+- **Извлечение из ZIP** (`extract_from_zip()`) — для offline-сценария.
+- **Валидация схемы** (`validate_schema()`) — проверка ожидаемых колонок, подсчёт null.
+- **Парсинг гео-данных** (`fetch_india_cities_geo()`) — скачивает JSON с городами Индии для geo-enrichment.
+- **CLI-интерфейс**: `python -m src.parser --all`.
+
+---
+
+## 9. Качество кода и воспроизводимость (CP2)
+
+- **docker-compose.yml** — сервисы `app` (тесты), `lint` (ruff), `jupyter` (ноутбуки).
+- **requirements.txt** — точные версии (numpy, pandas, scikit-learn, lightgbm, xgboost, catboost).
+- **12 тестов** (pytest) — все зелёные. Покрытие: preprocessing, modeling, XGBoost, CatBoost, Stacking, Quantile, новые фичи.
+- **ruff** — без ошибок на `src/`.
+- **fixed seed** — `SEED=42` во всех функциях.
+
+---
+
+## 10. Заключение
+
+- **Прогресс CP1 -> CP2.** Расширены модели (XGBoost, CatBoost, Quantile, Stacking), улучшен FE (customer aggregates, target encoding, interactions), добавлен парсинг данных, docker-compose, 12 тестов.
+- **Главный челлендж.** Тяжёлый правый хвост (skew ~ 47). Решение — `log1p(target)` + customer-level агрегаты.
+- **Что НЕ сработало:** PCA, стекинг не побеждает одиночный бустинг, CatBoost/XGBoost не превосходят LightGBM.
+- **Ограничения.** Модель предсказывает «типичную операцию клиента». Для аномально крупных транзакций нужна отдельная модель.
+- **Финальный артефакт:** `models/best_model_cp2.joblib`.
