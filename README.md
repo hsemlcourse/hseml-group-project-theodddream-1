@@ -146,13 +146,14 @@ python -m src.parser --geo
 
 | Модель | MAE (INR) | Примечание |
 |--------|-----------|------------|
-| XGBoost (tuned) | TBD | После тюнинга |
-| CatBoost (tuned, log1p) | TBD | CatBoost + log-trick |
-| LightGBM Quantile (alpha=0.5) | TBD | Прямая минимизация MAE |
-| Stacking (RF+LGBM+XGB -> Ridge) | TBD | Мета-обучение |
-| **LightGBM tuned, log1p, new FE** | TBD | CP2 победитель (ожидаемо) |
+| CatBoost (defaults) | 1912.29 | Лучший среди CP2 моделей |
+| Stacking log1p(target) | 1922.29 | RF+LGBM+XGB → Ridge, log-шкала |
+| CatBoost log1p(target) | 1922.30 | CatBoost + log-trick |
+| XGBoost log1p(target) | 1924.87 | XGBoost + log-trick |
+| LightGBM Quantile (alpha=0.5) | 1926.45 | Прямая минимизация MAE |
+| Stacking (RF+LGBM+XGB → Ridge) | 1955.22 | Мета-обучение |
 
-*TBD — заполняется после прогона `notebooks/04_cp2_experiments.ipynb` на данных.*
+**Вывод CP2:** расширенный FE (customer aggregates, target encoding) не улучшил CP1 winner — при ~2 транзакциях на клиента агрегаты оказались слишком шумными. Финальная модель проекта остаётся **CP1 winner** (LightGBM tuned, log1p, test MAE = 1343.92).
 
 **Замечание про R²/RMSE.** У победителя R² ~ 0 — это ожидаемый эффект `log1p(target)`: модель оптимизирует относительную ошибку на типичных операциях ценой точности на гигантских транзакциях. Согласовано с основной метрикой MAE и характером данных (skew ~ 47).
 

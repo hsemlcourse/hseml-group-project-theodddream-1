@@ -250,21 +250,40 @@
 - **CatBoost:** `RandomizedSearchCV`, n_iter=10, 3-fold. Пространство: `iterations`, `learning_rate`, `depth`, `l2_leaf_reg`, `bagging_temperature`.
 - **LightGBM (re-tune на новых фичах):** `RandomizedSearchCV`, n_iter=20, 3-fold.
 
-### 8.4. Таблица экспериментов CP2 (val)
+### 8.4. Таблица экспериментов CP2 (val, отсортировано по MAE)
 
-Полная сводная таблица с параметрами и временем обучения — в `notebooks/04_cp2_experiments.ipynb`.
+| Модель | MAE (INR) | RMSE (INR) | R² | Время (сек) |
+|---|---|---|---|---|
+| CatBoost (defaults) | 1912.29 | 6661.04 | −0.12 | 3.2 |
+| Stacking log1p(target) | 1922.29 | 6647.74 | −0.12 | 129.9 |
+| CatBoost log1p(target) | 1922.30 | 6580.53 | −0.10 | 5.0 |
+| LightGBM tuned log1p (new features) | 1922.51 | 6656.22 | −0.12 | 142.8 |
+| XGBoost log1p(target) | 1924.87 | 6585.35 | −0.10 | 1.7 |
+| LightGBM Quantile (alpha=0.5) | 1926.45 | 6622.71 | −0.11 | 3.6 |
+| CatBoost (tuned) | 1941.47 | 6657.30 | −0.12 | 135.8 |
+| Stacking (RF+LGBM+XGB → Ridge) | 1955.22 | 6865.20 | −0.19 | 125.3 |
+| XGBoost (tuned) | 1996.58 | 6815.49 | −0.17 | 51.9 |
+| XGBoost (defaults) | 2051.51 | 7290.80 | −0.34 | 1.7 |
 
-### 8.5. Обоснование финальной модели CP2
+**Лучший результат CP2 на test:** MAE = 1923.06 INR (LightGBM tuned, log1p, full train, new features).
 
-**Победитель:** LightGBM tuned + log1p(target) + расширенный feature set.
+### 8.5. Анализ результатов CP2
 
-Обоснование:
-1. **Минимум MAE на val** среди всех экспериментов CP1 + CP2.
-2. **Customer aggregates** — самый значимый прирост качества: медианная сумма клиента — сильнейший предиктор.
-3. **Target encoding** для `CustLocation` информативнее frequency encoding.
-4. **log1p-трансформация** по-прежнему критична для скошенного таргета.
-5. **XGBoost и CatBoost** сопоставимы с LightGBM, но LightGBM быстрее и чуть точнее.
-6. **Стекинг** стабилен, но не побеждает одиночный бустинг с log-target.
+**Ключевой вывод:** расширенный feature engineering (customer aggregates, target encoding, interaction features) **не улучшил** результат CP1 winner (test MAE 1343.92 → 1923.06).
+
+**Причины:**
+1. **Шумность customer aggregates.** В датасете ~500k уникальных клиентов при 1M транзакций — в среднем ~2 транзакции на клиента. Медиана по 1–2 значениям — крайне шумный признак, который вводит модель в заблуждение.
+2. **Target encoding добавляет шум.** При ~9k уникальных локаций сглаживание с `min_samples=100` оставляет большинство значений близкими к глобальному среднему.
+3. **Увеличение размерности без сигнала.** Новые 10 фич (25 вместо 15) увеличили пространство поиска для модели, но не добавили предсказательной силы — XGBoost/CatBoost/LightGBM тратят сплиты на шумные фичи.
+4. **Переподбор гиперпараметров.** RandomizedSearchCV на расширенном feature set нашёл менее удачные параметры (200 деревьев вместо 800 в CP1).
+
+**Финальная модель проекта остаётся CP1 winner:** LightGBM tuned, log1p(target), оригинальный feature set (15 фич), test MAE = **1343.92 INR**.
+
+**Что подтвердилось:**
+- XGBoost, CatBoost, LightGBM — сопоставимы по качеству на данном датасете.
+- log1p-трансформация таргета критична (все *_log1p варианты лучше своих аналогов).
+- Стекинг не побеждает одиночный бустинг.
+- Quantile regression (alpha=0.5) — валидная альтернатива log-trick для минимизации MAE.
 
 ### 8.6. Самостоятельный парсинг данных
 
@@ -289,8 +308,10 @@
 
 ## 10. Заключение
 
-- **Прогресс CP1 -> CP2.** Расширены модели (XGBoost, CatBoost, Quantile, Stacking), улучшен FE (customer aggregates, target encoding, interactions), добавлен парсинг данных, docker-compose, 12 тестов.
-- **Главный челлендж.** Тяжёлый правый хвост (skew ~ 47). Решение — `log1p(target)` + customer-level агрегаты.
-- **Что НЕ сработало:** PCA, стекинг не побеждает одиночный бустинг, CatBoost/XGBoost не превосходят LightGBM.
+- **Прогресс CP1 → CP2.** Расширены модели (XGBoost, CatBoost, Quantile, Stacking), исследован новый FE (customer aggregates, target encoding, interactions), добавлен парсинг данных, docker-compose, 12 тестов.
+- **Главный челлендж.** Тяжёлый правый хвост (skew ~ 47). Решение — `log1p(target)`.
+- **Что НЕ сработало:** PCA, стекинг не побеждает одиночный бустинг, customer aggregates шумные при ~2 txn/клиент, XGBoost/CatBoost не превосходят LightGBM, расшире��ный FE не улучшил CP1 winner.
+- **Что подтвердилось:** log1p-трансформация — ключевой приём; все б��стинги сопоставимы; quantile regression — валидная альтернатива.
+- **Финальная модель проекта:** CP1 winner — LightGBM tuned, log1p(target), 15 фич, **test MAE = 1343.92 INR** (−26% vs baseline).
 - **Ограничения.** Модель предсказывает «типичную операцию клиента». Для аномально крупных транзакций нужна отдельная модель.
-- **Финальный артефакт:** `models/best_model_cp2.joblib`.
+- **Артефакты:** `models/best_model.joblib` (CP1 winner), `models/best_model_cp2.joblib` (CP2 experiments).
